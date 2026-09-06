@@ -12,6 +12,14 @@ Panel {
 
   readonly property string script:
     Qt.resolvedUrl("bin/combine").toString().replace(/^file:\/\//, "")
+  readonly property var helperEnv: ({
+    "HOME": Quickshell.env("HOME") || "",
+    "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR") || "",
+    "LANG": "C",
+    "PATH": "/usr/bin:/bin"
+  })
+  readonly property int maxHelperBytes: 65536
+  readonly property int helperDeadlineMs: 10000
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -22,20 +30,33 @@ Panel {
   readonly property bool enabled: status.enabled === true
   readonly property int selectedCount: Model.selectedCount(status)
   readonly property string barText: Model.barLabel(status)
-  readonly property string barIcon: enabled ? "󰓃" : "󰕾"
+  readonly property string barIcon: enabled ? "󰓄" : "󰓃"
   readonly property bool canEnable: selectedCount >= 2
   readonly property string toggleHint: enabled ? "Stop sharing" : "Play on selected outputs"
+  readonly property string barTooltip: Model.tooltip(root.status)
+  readonly property string heroMetaText: Model.heroMeta(root.status)
 
   property string focusSection: "header"
   property int selectedIndex: 0
   property bool cursorActive: false
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
+  property string statusBuf: ""
+  property string actionBuf: ""
+  property int statusErrBytes: 0
+  property int actionErrBytes: 0
 
   implicitWidth: barRow.implicitWidth
   implicitHeight: button.implicitHeight
 
+  function pythonCommand(args) {
+    return ["/usr/bin/python3", "-I", "-S", root.script].concat(args)
+  }
+
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (statusProc.running) return
+    statusBuf = ""
+    statusErrBytes = 0
+    statusProc.running = true
   }
 
   function applyStatus(raw) {
@@ -47,18 +68,26 @@ Panel {
 
   function runAction(args) {
     if (actionProc.running) return
-    actionProc.command = ["/usr/bin/python3", root.script].concat(args)
+    actionBuf = ""
+    actionErrBytes = 0
+    actionProc.command = pythonCommand(args)
     actionProc.running = true
   }
 
   function toggleOutput(name) {
-    if (!name) return
+    if (!Model.validSinkName(name)) return
     runAction(["toggle", name])
   }
 
   function toggleSharing() {
     if (enabled) runAction(["off"])
     else if (canEnable) runAction(["on"])
+  }
+
+  function stopHelper(proc, killTimer) {
+    if (!proc.running) return
+    proc.signal(15)
+    killTimer.start()
   }
 
   function setHeaderCursor() {
@@ -103,21 +132,88 @@ Panel {
 
   Process {
     id: statusProc
-    command: ["/usr/bin/python3", root.script, "status"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
+    command: pythonCommand(["status"])
+    clearEnvironment: true
+    environment: root.helperEnv
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.statusBuf += chunk
+        if (root.statusBuf.length > root.maxHelperBytes) {
+          root.statusBuf = ""
+          root.stopHelper(statusProc, statusKill)
+        }
+      }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.statusErrBytes += String(chunk).length
+        if (root.statusErrBytes > 4096) root.stopHelper(statusProc, statusKill)
+      }
+    }
+    onStarted: statusDeadline.restart()
+    onExited: function(code) {
+      statusDeadline.stop()
+      statusKill.stop()
+      if (code === 0) root.applyStatus(root.statusBuf)
+      root.statusBuf = ""
+      root.statusErrBytes = 0
     }
   }
 
   Process {
     id: actionProc
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
+    clearEnvironment: true
+    environment: root.helperEnv
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.actionBuf += chunk
+        if (root.actionBuf.length > root.maxHelperBytes) {
+          root.actionBuf = ""
+          root.stopHelper(actionProc, actionKill)
+        }
+      }
     }
-    onExited: function() { root.refresh() }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.actionErrBytes += String(chunk).length
+        if (root.actionErrBytes > 4096) root.stopHelper(actionProc, actionKill)
+      }
+    }
+    onStarted: actionDeadline.restart()
+    onExited: function(code) {
+      actionDeadline.stop()
+      actionKill.stop()
+      if (code === 0) root.applyStatus(root.actionBuf)
+      root.actionBuf = ""
+      root.actionErrBytes = 0
+      root.refresh()
+    }
+  }
+
+  Timer {
+    id: statusDeadline
+    interval: root.helperDeadlineMs
+    onTriggered: root.stopHelper(statusProc, statusKill)
+  }
+  Timer {
+    id: actionDeadline
+    interval: root.helperDeadlineMs
+    onTriggered: root.stopHelper(actionProc, actionKill)
+  }
+  Timer {
+    id: statusKill
+    interval: 2000
+    onTriggered: statusProc.signal(9)
+  }
+  Timer {
+    id: actionKill
+    interval: 2000
+    onTriggered: actionProc.signal(9)
   }
 
   Timer {
@@ -135,6 +231,11 @@ Panel {
     root.refresh()
   }
 
+  Component.onDestruction: {
+    root.stopHelper(statusProc, statusKill)
+    root.stopHelper(actionProc, actionKill)
+  }
+
   Row {
     id: barRow
     anchors.left: parent.left
@@ -150,7 +251,7 @@ Panel {
       text: root.barIcon
       active: root.enabled
       dimmed: !root.enabled
-      tooltipText: Model.tooltip(root.status)
+      tooltipText: root.barTooltip
       onPressed: function(b) {
         if (b === Qt.RightButton) root.toggleSharing()
         else root.toggle()
@@ -166,7 +267,7 @@ Panel {
       fontSize: Style.font.bodySmall
       horizontalMargin: 2
       active: root.enabled
-      tooltipText: button.tooltipText
+      tooltipText: root.barTooltip
       onPressed: function(b) {
         if (b === Qt.RightButton) root.toggleSharing()
         else root.toggle()
@@ -205,7 +306,7 @@ Panel {
         PanelHero {
           width: parent.width
           title: "omarchy-multi-output"
-          meta: Model.heroMeta(root.status)
+          meta: root.heroMetaText
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconOpacity: root.enabled ? 1.0 : 0.55
@@ -259,7 +360,7 @@ Panel {
             required property var modelData
             required property int index
             width: column.width
-            label: modelData.description || modelData.name
+            label: Model.plain(modelData.description || modelData.name)
             description: modelData.selected && root.enabled ? "Playing" : (modelData.selected ? "Selected" : "")
             checked: modelData.selected === true
             hasCursor: root.cursorActive && root.focusSection === "outputs" && root.selectedIndex === index

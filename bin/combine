@@ -1,13 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Create, update, or tear down a PipeWire combine-sink for several outputs."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import select
+import signal
+import stat
 import subprocess
 import sys
-from pathlib import Path
+import time
 
 COMBINE_NAME = "omarchy_multi_output"
 COMBINE_DESCRIPTION = "omarchy-multi-output"
@@ -22,41 +26,374 @@ SKIP_PARTS = (
     "omarchy_speaker_tuning",
     "combine",
 )
-STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-STATE_PATH = STATE_HOME / "omarchy/omarchy-multi-output/state.json"
-LEGACY_STATE_PATHS = (
-    STATE_HOME / "omarchy/muj.multi-output/state.json",
-    CONFIG_HOME / "omarchy/plugins/omarchy-multi-output/state.json",
-    CONFIG_HOME / "omarchy/plugins/muj.multi-output/state.json",
-)
+PACTL = "/usr/bin/pactl"
+SINK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+MODULE_ID_RE = re.compile(r"^[0-9]{1,10}$")
+STREAM_INDEX_RE = re.compile(r"^[0-9]{1,10}$")
+MAX_STATE_BYTES = 65536
+MAX_PACTL_BYTES = 262144
+MAX_STDERR_BYTES = 4096
+MAX_OUTPUTS = 24
+MAX_STREAMS = 64
+MAX_LABEL = 80
+PACTL_TIMEOUT = 4.0
+COMMAND_DEADLINE = 8.0
+STATE_DIR_PARTS = (".local", "state", "omarchy", "omarchy-multi-output")
+LEGACY_DIR_PARTS = (".local", "state", "omarchy", "muj.multi-output")
+STATE_NAME = "state.json"
 
 
-def run(args: list[str], timeout: float = 4) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+def child_env() -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C",
+    }
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        env["XDG_RUNTIME_DIR"] = runtime
+    return env
+
+
+def valid_sink_name(name: str) -> bool:
+    return bool(SINK_NAME_RE.fullmatch(name)) and name not in (".", "..")
+
+
+def plain(value: object, limit: int = MAX_LABEL) -> str:
+    text = str(value or "")
+    cleaned = []
+    for char in text:
+        code = ord(char)
+        if char in "<>&" or code < 32 or code == 127 or 0x80 <= code <= 0x9F:
+            continue
+        if 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069:
+            continue
+        cleaned.append(char)
+        if len(cleaned) >= limit:
+            break
+    return "".join(cleaned)
+
+
+def open_dir_chain(parts: tuple[str, ...] | list[str], home: str | None = None) -> int:
+    home_path = home or os.path.expanduser("~")
+    fd = os.open(home_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for name in parts:
+            if name in ("", ".", "..") or "/" in name or name.startswith("."):
+                if name not in (".local",):
+                    raise PermissionError(f"untrusted directory component {name}")
+            try:
+                next_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                os.mkdir(name, 0o700, dir_fd=fd)
+                next_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            os.close(fd)
+            fd = next_fd
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                raise PermissionError(f"untrusted directory component {name}")
+        info = os.fstat(fd)
+        if info.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def repair_state_dir(dirfd: int) -> None:
+    try:
+        names = os.listdir(dirfd)
+    except OSError:
+        return
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and name == STATE_NAME:
+            try:
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dirfd,
+                )
+            except OSError:
+                continue
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
+
+
+def read_bounded(dirfd: int, name: str) -> bytes | None:
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=dirfd,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_size > MAX_STATE_BYTES
+        ):
+            raise PermissionError("refusing state file")
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= MAX_STATE_BYTES:
+            chunk = os.read(fd, min(65536, MAX_STATE_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > MAX_STATE_BYTES:
+            raise PermissionError("state file grew past the limit")
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_atomic(dirfd: int, name: str, data: bytes) -> None:
+    if len(data) > MAX_STATE_BYTES:
+        raise ValueError("payload too large")
+    tmp = f".{name}.{os.urandom(8).hex()}.tmp"
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=dirfd,
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def parse_state_bytes(raw: bytes | None) -> dict | None:
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    slaves = data.get("slaves")
+    if not isinstance(slaves, list) or len(slaves) > MAX_OUTPUTS:
+        return None
+    names = []
+    for item in slaves:
+        if not isinstance(item, str) or not valid_sink_name(item):
+            return None
+        names.append(item)
+    previous = data.get("previousDefault") or ""
+    if previous and not isinstance(previous, str):
+        return None
+    previous = str(previous)
+    if previous and not valid_sink_name(previous):
+        previous = ""
+    return {"slaves": names, "previousDefault": previous}
+
+
+def load_state() -> dict:
+    dirfd = open_dir_chain(STATE_DIR_PARTS)
+    try:
+        repair_state_dir(dirfd)
+        try:
+            parsed = parse_state_bytes(read_bounded(dirfd, STATE_NAME))
+        except PermissionError:
+            return {"slaves": [], "previousDefault": ""}
+        if parsed is not None:
+            return parsed
+    finally:
+        os.close(dirfd)
+    try:
+        legacy_fd = open_dir_chain(LEGACY_DIR_PARTS)
+    except OSError:
+        return {"slaves": [], "previousDefault": ""}
+    try:
+        try:
+            parsed = parse_state_bytes(read_bounded(legacy_fd, STATE_NAME))
+        except PermissionError:
+            parsed = None
+        if parsed is None:
+            return {"slaves": [], "previousDefault": ""}
+        save_state(parsed)
+        try:
+            os.unlink(STATE_NAME, dir_fd=legacy_fd)
+        except OSError:
+            pass
+        return parsed
+    finally:
+        os.close(legacy_fd)
+
+
+def save_state(state: dict) -> None:
+    payload = json.dumps(
+        {
+            "slaves": [name for name in state.get("slaves", []) if valid_sink_name(name)][:MAX_OUTPUTS],
+            "previousDefault": state.get("previousDefault") or "",
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    encoded = (payload + "\n").encode("utf-8")
+    dirfd = open_dir_chain(STATE_DIR_PARTS)
+    try:
+        repair_state_dir(dirfd)
+        try:
+            current = read_bounded(dirfd, STATE_NAME)
+        except PermissionError:
+            current = b""
+        if current == encoded:
+            return
+        write_atomic(dirfd, STATE_NAME, encoded)
+    finally:
+        os.close(dirfd)
+
+
+def _kill_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except OSError:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+
+
+def run_pactl(args: list[str], timeout: float = PACTL_TIMEOUT) -> subprocess.CompletedProcess[str]:
+    command = [PACTL, *args]
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        env=child_env(),
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = False
+    assert proc.stdout is not None and proc.stderr is not None
+    try:
+        while proc.poll() is None:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select(
+                [proc.stdout, proc.stderr], [], [], min(remaining, 0.2)
+            )
+            if proc.stdout in ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if chunk:
+                    stdout += chunk
+                    if len(stdout) > MAX_PACTL_BYTES:
+                        overflow = True
+                        break
+            if proc.stderr in ready:
+                chunk = os.read(proc.stderr.fileno(), 4096)
+                if chunk:
+                    stderr += chunk[: MAX_STDERR_BYTES + 1 - len(stderr)]
+                    if len(stderr) > MAX_STDERR_BYTES:
+                        overflow = True
+                        break
+        if proc.poll() is None:
+            _kill_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, signal.SIGKILL)
+                proc.wait(timeout=2)
+        else:
+            while len(stdout) <= MAX_PACTL_BYTES:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                stdout += chunk
+            while len(stderr) <= MAX_STDERR_BYTES:
+                chunk = os.read(proc.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                stderr += chunk
+            if len(stdout) > MAX_PACTL_BYTES or len(stderr) > MAX_STDERR_BYTES:
+                overflow = True
+    finally:
+        if proc.poll() is None:
+            _kill_group(proc, signal.SIGKILL)
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+    if overflow:
+        return subprocess.CompletedProcess(command, 1, "", "output exceeded limit")
+    return subprocess.CompletedProcess(
+        command,
+        proc.returncode if proc.returncode is not None else 1,
+        stdout.decode("utf-8", "replace"),
+        stderr.decode("utf-8", "replace")[:MAX_STDERR_BYTES],
+    )
 
 
 def pactl_json(kind: str) -> list:
-    result = run(["pactl", "-f", "json", "list", kind])
+    if kind not in ("sinks", "sink-inputs"):
+        return []
+    result = run_pactl(["-f", "json", "list", kind])
     if result.returncode != 0 or not result.stdout.strip():
         return []
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
         return []
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list) or len(data) > 4096:
+        return []
+    return data
 
 
 def skip_sink(name: str) -> bool:
-    lowered = name.lower()
-    if name in OWNED_SINKS:
+    if not valid_sink_name(name) or name in OWNED_SINKS:
         return True
+    lowered = name.lower()
     return any(part in lowered for part in SKIP_PARTS)
 
 
 def sink_description(sink: dict) -> str:
-    props = sink.get("properties") or {}
-    return str(
+    props = sink.get("properties") if isinstance(sink.get("properties"), dict) else {}
+    return plain(
         sink.get("description")
         or props.get("device.description")
         or props.get("node.nick")
@@ -68,73 +405,37 @@ def sink_description(sink: dict) -> str:
 def list_sinks() -> list[dict]:
     rows = []
     for sink in pactl_json("sinks"):
-        name = str(sink.get("name") or "")
-        if not name or skip_sink(name):
+        if not isinstance(sink, dict):
+            continue
+        name = sink.get("name")
+        if not isinstance(name, str) or skip_sink(name):
             continue
         rows.append({"name": name, "description": sink_description(sink)})
+        if len(rows) >= MAX_OUTPUTS:
+            break
     return rows
 
 
 def default_sink() -> str:
-    result = run(["pactl", "get-default-sink"])
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def _read_state_file(path: Path) -> dict | None:
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    slaves = data.get("slaves")
-    return {
-        "slaves": [str(name) for name in slaves] if isinstance(slaves, list) else [],
-        "previousDefault": str(data.get("previousDefault") or ""),
-    }
-
-
-def load_state() -> dict:
-    state = _read_state_file(STATE_PATH)
-    if state is not None:
-        return state
-    for path in LEGACY_STATE_PATHS:
-        legacy = _read_state_file(path)
-        if legacy is None:
-            continue
-        save_state(legacy)
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return legacy
-    return {"slaves": [], "previousDefault": ""}
-
-
-def save_state(state: dict) -> None:
-    payload = json.dumps(state, indent=2) + "\n"
-    if STATE_PATH.is_file() and STATE_PATH.read_text() == payload:
-        return
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(payload)
+    result = run_pactl(["get-default-sink"])
+    name = result.stdout.strip() if result.returncode == 0 else ""
+    return name if valid_sink_name(name) else ""
 
 
 def combine_module() -> tuple[str | None, str]:
-    result = run(["pactl", "list", "short", "modules"])
+    result = run_pactl(["list", "short", "modules"])
     if result.returncode != 0:
         return None, ""
-    for line in result.stdout.splitlines():
+    for line in result.stdout.splitlines()[:512]:
         parts = line.split("\t")
         if len(parts) < 2:
             continue
         index, name = parts[0], parts[1]
         argument = parts[2] if len(parts) > 2 else ""
-        if name != "module-combine-sink":
+        if not MODULE_ID_RE.fullmatch(index) or name != "module-combine-sink":
             continue
         if any(f"sink_name={owned}" in argument for owned in OWNED_SINKS):
-            return index, argument
+            return index, argument[:4096]
     return None, ""
 
 
@@ -151,39 +452,55 @@ def argument_value(argument: str, key: str) -> str:
 
 
 def slaves_from_argument(argument: str) -> list[str]:
-    return [name for name in argument_value(argument, "slaves").split(",") if name]
+    names = []
+    for name in argument_value(argument, "slaves").split(","):
+        if valid_sink_name(name):
+            names.append(name)
+        if len(names) >= MAX_OUTPUTS:
+            break
+    return names
 
 
 def unload_combine() -> None:
+    seen = set()
     while True:
         module_id = combine_module_id()
-        if not module_id:
+        if not module_id or module_id in seen:
             return
-        run(["pactl", "unload-module", module_id])
+        seen.add(module_id)
+        run_pactl(["unload-module", module_id])
 
 
 def move_streams(sink_name: str) -> None:
+    if not valid_sink_name(sink_name):
+        return
+    moved = 0
     for item in pactl_json("sink-inputs"):
-        props = item.get("properties") or {}
-        app = str(props.get("application.name") or "")
+        if not isinstance(item, dict):
+            continue
+        props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+        app = plain(props.get("application.name") or "", 64)
         if not app or app == "EasyEffects":
             continue
         index = item.get("index")
-        if index is None:
+        if not STREAM_INDEX_RE.fullmatch(str(index)):
             continue
-        run(["pactl", "move-sink-input", str(index), sink_name])
+        run_pactl(["move-sink-input", str(index), sink_name])
+        moved += 1
+        if moved >= MAX_STREAMS:
+            break
 
 
 def set_default(sink_name: str) -> None:
-    if not sink_name:
+    if not valid_sink_name(sink_name):
         return
-    run(["pactl", "set-default-sink", sink_name])
+    run_pactl(["set-default-sink", sink_name])
     move_streams(sink_name)
 
 
 def restore_previous(state: dict, available_names: set[str]) -> None:
     previous = state.get("previousDefault") or ""
-    if previous and previous in available_names:
+    if previous in available_names:
         set_default(previous)
         return
     for sink in list_sinks():
@@ -193,7 +510,7 @@ def restore_previous(state: dict, available_names: set[str]) -> None:
 
 def apply(state: dict, available: list[dict]) -> dict:
     available_names = {row["name"] for row in available}
-    selected = [name for name in state["slaves"] if name in available_names]
+    selected = [name for name in state["slaves"] if name in available_names][:MAX_OUTPUTS]
     current_default = default_sink()
 
     if len(selected) < 2:
@@ -207,9 +524,8 @@ def apply(state: dict, available: list[dict]) -> dict:
 
     unload_combine()
     slaves = ",".join(selected)
-    result = run(
+    result = run_pactl(
         [
-            "pactl",
             "load-module",
             "module-combine-sink",
             f"sink_name={COMBINE_NAME}",
@@ -219,17 +535,20 @@ def apply(state: dict, available: list[dict]) -> dict:
         ]
     )
     if result.returncode != 0:
-        raise SystemExit(result.stderr.strip() or "failed to load combine-sink")
+        raise SystemExit("failed to load combine-sink")
     set_default(COMBINE_NAME)
     return state
 
 
 def status_payload() -> dict:
+    deadline = time.monotonic() + COMMAND_DEADLINE
     state = load_state()
     module_id, argument = combine_module()
     if module_id and not state["slaves"]:
         state["slaves"] = slaves_from_argument(argument)
         save_state(state)
+    if time.monotonic() > deadline:
+        return empty_error()
     available = list_sinks()
     available_names = {row["name"] for row in available}
     present = [name for name in state["slaves"] if name in available_names]
@@ -246,7 +565,7 @@ def status_payload() -> dict:
         "ok": True,
         "enabled": bool(module_id),
         "sink": COMBINE_NAME,
-        "slaves": state["slaves"],
+        "slaves": state["slaves"][:MAX_OUTPUTS],
         "previousDefault": state.get("previousDefault") or "",
         "available": [
             {
@@ -254,36 +573,55 @@ def status_payload() -> dict:
                 "description": row["description"],
                 "selected": row["name"] in selected,
             }
-            for row in available
+            for row in available[:MAX_OUTPUTS]
         ],
     }
 
 
+def empty_error() -> dict:
+    return {
+        "ok": False,
+        "enabled": False,
+        "sink": COMBINE_NAME,
+        "slaves": [],
+        "previousDefault": "",
+        "available": [],
+    }
+
+
+def emit(payload: dict) -> int:
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > MAX_STATE_BYTES:
+        encoded = json.dumps(empty_error(), ensure_ascii=True).encode("utf-8")
+    sys.stdout.buffer.write(encoded)
+    sys.stdout.buffer.write(b"\n")
+    return 0 if payload.get("ok") else 1
+
+
 def cmd_status() -> int:
-    print(json.dumps(status_payload(), ensure_ascii=False))
-    return 0
+    return emit(status_payload())
 
 
 def cmd_toggle(name: str) -> int:
-    if not name or skip_sink(name):
-        raise SystemExit(f"unknown output: {name}")
+    if not valid_sink_name(name) or skip_sink(name):
+        raise SystemExit("unknown output")
     state = load_state()
     slaves = list(state["slaves"])
     if name in slaves:
         slaves.remove(name)
     else:
+        if len(slaves) >= MAX_OUTPUTS:
+            raise SystemExit("too many outputs")
         slaves.append(name)
     state["slaves"] = slaves
     available = list_sinks()
     names = {row["name"] for row in available}
     if name not in names:
         save_state(state)
-        print(json.dumps(status_payload(), ensure_ascii=False))
-        return 0
+        return emit(status_payload())
     state = apply(state, available)
     save_state(state)
-    print(json.dumps(status_payload(), ensure_ascii=False))
-    return 0
+    return emit(status_payload())
 
 
 def cmd_on() -> int:
@@ -291,8 +629,7 @@ def cmd_on() -> int:
     available = list_sinks()
     state = apply(state, available)
     save_state(state)
-    print(json.dumps(status_payload(), ensure_ascii=False))
-    return 0
+    return emit(status_payload())
 
 
 def cmd_off() -> int:
@@ -302,8 +639,7 @@ def cmd_off() -> int:
     unload_combine()
     restore_previous(state, names)
     save_state(state)
-    print(json.dumps(status_payload(), ensure_ascii=False))
-    return 0
+    return emit(status_payload())
 
 
 def main() -> int:
@@ -324,6 +660,11 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except subprocess.TimeoutExpired:
-        print(json.dumps({"ok": False, "enabled": False, "slaves": [], "available": []}))
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            emit(empty_error())
+            raise SystemExit(1) from None
+        raise
+    except (subprocess.TimeoutExpired, PermissionError, ValueError, OSError):
+        emit(empty_error())
         raise SystemExit(1)
