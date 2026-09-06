@@ -50,7 +50,7 @@ MIT — see [LICENSE](LICENSE).
 - **`/usr/bin/pactl`** — PipeWire Pulse compatibility, used to load and tear
   down `module-combine-sink`.
 
-No `sudo` or `pkexec` is required. Loading the plugin does not edit Hyprland
+The plugin does not request elevated privileges. Loading the plugin does not edit Hyprland
 config, `shell.json`, or any file outside the plugin-owned state directory
 except through Omarchy's normal plugin enable path.
 
