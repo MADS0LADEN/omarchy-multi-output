@@ -142,11 +142,16 @@ def combine_module_id() -> str | None:
     return combine_module()[0]
 
 
-def slaves_from_argument(argument: str) -> list[str]:
+def argument_value(argument: str, key: str) -> str:
+    prefix = key + "="
     for part in argument.split():
-        if part.startswith("slaves="):
-            return [name for name in part.split("=", 1)[1].split(",") if name]
-    return []
+        if part.startswith(prefix):
+            return part.split("=", 1)[1]
+    return ""
+
+
+def slaves_from_argument(argument: str) -> list[str]:
+    return [name for name in argument_value(argument, "slaves").split(",") if name]
 
 
 def unload_combine() -> None:
@@ -229,7 +234,10 @@ def status_payload() -> dict:
     available_names = {row["name"] for row in available}
     present = [name for name in state["slaves"] if name in available_names]
     running = slaves_from_argument(argument) if module_id else []
-    if len(present) >= 2 and set(present) != set(running):
+    running_name = argument_value(argument, "sink_name") if module_id else ""
+    if len(present) >= 2 and (
+        set(present) != set(running) or running_name != COMBINE_NAME
+    ):
         state = apply(state, available)
         save_state(state)
         module_id, argument = combine_module()
