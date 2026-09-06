@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "muj.multi-output",
+  "name": "Multi-output",
+  "version": "1.0.0",
+  "author": "muj",
+  "license": "MIT",
+  "description": "Play the same audio on two or more outputs at once, such as two AirPods.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Multi-output",
+    "description": "Send system audio to several sinks at the same time",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

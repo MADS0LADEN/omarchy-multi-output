@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Create, update, or tear down a PipeWire combine-sink for several outputs."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+COMBINE_NAME = "muj_multi_output"
+COMBINE_DESCRIPTION = "Multi-output"
+SKIP_PARTS = (
+    "easyeffects",
+    "filter-chain",
+    "loopback",
+    "null-sink",
+    "auto_null",
+    "omarchy_speaker_tuning",
+    "combine",
+)
+LEGACY_STATE_PATH = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    / "omarchy/plugins/muj.multi-output/state.json"
+)
+STATE_PATH = (
+    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    / "omarchy/muj.multi-output/state.json"
+)
+
+
+def run(args: list[str], timeout: float = 4) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def pactl_json(kind: str) -> list:
+    result = run(["pactl", "-f", "json", "list", kind])
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def skip_sink(name: str) -> bool:
+    lowered = name.lower()
+    if name == COMBINE_NAME:
+        return True
+    return any(part in lowered for part in SKIP_PARTS)
+
+
+def sink_description(sink: dict) -> str:
+    props = sink.get("properties") or {}
+    return str(
+        sink.get("description")
+        or props.get("device.description")
+        or props.get("node.nick")
+        or sink.get("name")
+        or "Output"
+    )
+
+
+def list_sinks() -> list[dict]:
+    rows = []
+    for sink in pactl_json("sinks"):
+        name = str(sink.get("name") or "")
+        if not name or skip_sink(name):
+            continue
+        rows.append({"name": name, "description": sink_description(sink)})
+    return rows
+
+
+def default_sink() -> str:
+    result = run(["pactl", "get-default-sink"])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _read_state_file(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    slaves = data.get("slaves")
+    return {
+        "slaves": [str(name) for name in slaves] if isinstance(slaves, list) else [],
+        "previousDefault": str(data.get("previousDefault") or ""),
+    }
+
+
+def load_state() -> dict:
+    state = _read_state_file(STATE_PATH)
+    if state is not None:
+        return state
+    legacy = _read_state_file(LEGACY_STATE_PATH)
+    if legacy is not None:
+        save_state(legacy)
+        try:
+            LEGACY_STATE_PATH.unlink()
+        except OSError:
+            pass
+        return legacy
+    return {"slaves": [], "previousDefault": ""}
+
+
+def save_state(state: dict) -> None:
+    payload = json.dumps(state, indent=2) + "\n"
+    if STATE_PATH.is_file() and STATE_PATH.read_text() == payload:
+        return
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(payload)
+
+
+def combine_module() -> tuple[str | None, str]:
+    result = run(["pactl", "list", "short", "modules"])
+    if result.returncode != 0:
+        return None, ""
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        index, name = parts[0], parts[1]
+        argument = parts[2] if len(parts) > 2 else ""
+        if name == "module-combine-sink" and f"sink_name={COMBINE_NAME}" in argument:
+            return index, argument
+    return None, ""
+
+
+def combine_module_id() -> str | None:
+    return combine_module()[0]
+
+
+def slaves_from_argument(argument: str) -> list[str]:
+    for part in argument.split():
+        if part.startswith("slaves="):
+            return [name for name in part.split("=", 1)[1].split(",") if name]
+    return []
+
+
+def unload_combine() -> None:
+    module_id = combine_module_id()
+    if module_id:
+        run(["pactl", "unload-module", module_id])
+
+
+def move_streams(sink_name: str) -> None:
+    for item in pactl_json("sink-inputs"):
+        props = item.get("properties") or {}
+        app = str(props.get("application.name") or "")
+        if not app or app == "EasyEffects":
+            continue
+        index = item.get("index")
+        if index is None:
+            continue
+        run(["pactl", "move-sink-input", str(index), sink_name])
+
+
+def set_default(sink_name: str) -> None:
+    if not sink_name:
+        return
+    run(["pactl", "set-default-sink", sink_name])
+    move_streams(sink_name)
+
+
+def restore_previous(state: dict, available_names: set[str]) -> None:
+    previous = state.get("previousDefault") or ""
+    if previous and previous in available_names:
+        set_default(previous)
+        return
+    for sink in list_sinks():
+        set_default(sink["name"])
+        return
+
+
+def apply(state: dict, available: list[dict]) -> dict:
+    available_names = {row["name"] for row in available}
+    selected = [name for name in state["slaves"] if name in available_names]
+    current_default = default_sink()
+
+    if len(selected) < 2:
+        if combine_module_id():
+            unload_combine()
+            restore_previous(state, available_names)
+        return state
+
+    if current_default and current_default != COMBINE_NAME:
+        state["previousDefault"] = current_default
+
+    unload_combine()
+    slaves = ",".join(selected)
+    result = run(
+        [
+            "pactl",
+            "load-module",
+            "module-combine-sink",
+            f"sink_name={COMBINE_NAME}",
+            f"slaves={slaves}",
+            f"sink_properties=device.description={COMBINE_DESCRIPTION}",
+            "latency_compensate=true",
+        ]
+    )
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "failed to load combine-sink")
+    set_default(COMBINE_NAME)
+    return state
+
+
+def status_payload() -> dict:
+    state = load_state()
+    module_id, argument = combine_module()
+    if module_id and not state["slaves"]:
+        state["slaves"] = slaves_from_argument(argument)
+        save_state(state)
+    available = list_sinks()
+    available_names = {row["name"] for row in available}
+    present = [name for name in state["slaves"] if name in available_names]
+    running = slaves_from_argument(argument) if module_id else []
+    if len(present) >= 2 and set(present) != set(running):
+        state = apply(state, available)
+        save_state(state)
+        module_id, argument = combine_module()
+    selected = set(state["slaves"])
+    return {
+        "ok": True,
+        "enabled": bool(module_id),
+        "sink": COMBINE_NAME,
+        "slaves": state["slaves"],
+        "previousDefault": state.get("previousDefault") or "",
+        "available": [
+            {
+                "name": row["name"],
+                "description": row["description"],
+                "selected": row["name"] in selected,
+            }
+            for row in available
+        ],
+    }
+
+
+def cmd_status() -> int:
+    print(json.dumps(status_payload(), ensure_ascii=False))
+    return 0
+
+
+def cmd_toggle(name: str) -> int:
+    if not name or skip_sink(name):
+        raise SystemExit(f"unknown output: {name}")
+    state = load_state()
+    slaves = list(state["slaves"])
+    if name in slaves:
+        slaves.remove(name)
+    else:
+        slaves.append(name)
+    state["slaves"] = slaves
+    available = list_sinks()
+    names = {row["name"] for row in available}
+    if name not in names:
+        save_state(state)
+        print(json.dumps(status_payload(), ensure_ascii=False))
+        return 0
+    state = apply(state, available)
+    save_state(state)
+    print(json.dumps(status_payload(), ensure_ascii=False))
+    return 0
+
+
+def cmd_on() -> int:
+    state = load_state()
+    available = list_sinks()
+    state = apply(state, available)
+    save_state(state)
+    print(json.dumps(status_payload(), ensure_ascii=False))
+    return 0
+
+
+def cmd_off() -> int:
+    state = load_state()
+    available = list_sinks()
+    names = {row["name"] for row in available}
+    unload_combine()
+    restore_previous(state, names)
+    save_state(state)
+    print(json.dumps(status_payload(), ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if action == "status":
+        return cmd_status()
+    if action == "toggle":
+        if len(sys.argv) < 3:
+            raise SystemExit("usage: combine toggle <sink-name>")
+        return cmd_toggle(sys.argv[2])
+    if action == "on":
+        return cmd_on()
+    if action == "off":
+        return cmd_off()
+    raise SystemExit("usage: combine [status|toggle <sink>|on|off]")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"ok": False, "enabled": False, "slaves": [], "available": []}))
+        raise SystemExit(1)
