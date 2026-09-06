@@ -25,6 +25,16 @@ def load_combine():
 C = load_combine()
 
 
+class ModuleParseTests(unittest.TestCase):
+    def test_parse_counts_duplicate_modules(self):
+        text = (
+            "1\tmodule-combine-sink\tsink_name=omarchy_multi_output slaves=a,b\n"
+            "2\tmodule-combine-sink\tsink_name=omarchy_multi_output slaves=a,b\n"
+            "3\tmodule-combine-sink\tsink_name=omarchy_multi_output slaves=a,b\n"
+        )
+        self.assertEqual(len(C.parse_combine_modules(text)), 3)
+
+
 class SinkNameTests(unittest.TestCase):
     def test_accepts_pipewire_names(self):
         self.assertTrue(C.valid_sink_name("bluez_output.AA_BB_CC_DD_EE_FF.1"))

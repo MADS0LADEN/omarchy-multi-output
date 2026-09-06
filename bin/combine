@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -41,6 +42,7 @@ COMMAND_DEADLINE = 8.0
 STATE_DIR_PARTS = (".local", "state", "omarchy", "omarchy-multi-output")
 LEGACY_DIR_PARTS = (".local", "state", "omarchy", "muj.multi-output")
 STATE_NAME = "state.json"
+LOCK_NAME = "combine.lock"
 
 
 def child_env() -> dict[str, str]:
@@ -422,11 +424,9 @@ def default_sink() -> str:
     return name if valid_sink_name(name) else ""
 
 
-def combine_module() -> tuple[str | None, str]:
-    result = run_pactl(["list", "short", "modules"])
-    if result.returncode != 0:
-        return None, ""
-    for line in result.stdout.splitlines()[:512]:
+def parse_combine_modules(text: str) -> list[tuple[str, str]]:
+    found = []
+    for line in text.splitlines()[:512]:
         parts = line.split("\t")
         if len(parts) < 2:
             continue
@@ -435,12 +435,53 @@ def combine_module() -> tuple[str | None, str]:
         if not MODULE_ID_RE.fullmatch(index) or name != "module-combine-sink":
             continue
         if any(f"sink_name={owned}" in argument for owned in OWNED_SINKS):
-            return index, argument[:4096]
-    return None, ""
+            found.append((index, argument[:4096]))
+    return found
+
+
+def combine_modules() -> list[tuple[str, str]]:
+    result = run_pactl(["list", "short", "modules"])
+    if result.returncode != 0:
+        return []
+    return parse_combine_modules(result.stdout)
+
+
+def combine_module() -> tuple[str | None, str]:
+    modules = combine_modules()
+    if not modules:
+        return None, ""
+    return modules[0]
 
 
 def combine_module_id() -> str | None:
     return combine_module()[0]
+
+
+def exclusive_lock() -> int:
+    dirfd = open_dir_chain(STATE_DIR_PARTS)
+    try:
+        fd = os.open(
+            LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dirfd,
+        )
+    finally:
+        os.close(dirfd)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+        ):
+            raise PermissionError("refusing lock file")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def argument_value(argument: str, key: str) -> str:
@@ -462,12 +503,7 @@ def slaves_from_argument(argument: str) -> list[str]:
 
 
 def unload_combine() -> None:
-    seen = set()
-    while True:
-        module_id = combine_module_id()
-        if not module_id or module_id in seen:
-            return
-        seen.add(module_id)
+    for module_id, _argument in combine_modules():
         run_pactl(["unload-module", module_id])
 
 
@@ -543,7 +579,8 @@ def apply(state: dict, available: list[dict]) -> dict:
 def status_payload() -> dict:
     deadline = time.monotonic() + COMMAND_DEADLINE
     state = load_state()
-    module_id, argument = combine_module()
+    modules = combine_modules()
+    module_id, argument = modules[0] if modules else (None, "")
     if module_id and not state["slaves"]:
         state["slaves"] = slaves_from_argument(argument)
         save_state(state)
@@ -554,11 +591,16 @@ def status_payload() -> dict:
     present = [name for name in state["slaves"] if name in available_names]
     running = slaves_from_argument(argument) if module_id else []
     running_name = argument_value(argument, "sink_name") if module_id else ""
-    if len(present) >= 2 and (
+    duplicates = len(modules) > 1
+    mismatch = len(present) >= 2 and (
         set(present) != set(running) or running_name != COMBINE_NAME
-    ):
-        state = apply(state, available)
-        save_state(state)
+    )
+    if duplicates or mismatch:
+        if len(present) >= 2:
+            state = apply(state, available)
+            save_state(state)
+        elif duplicates:
+            unload_combine()
         module_id, argument = combine_module()
     selected = set(state["slaves"])
     return {
@@ -644,17 +686,21 @@ def cmd_off() -> int:
 
 def main() -> int:
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if action == "status":
-        return cmd_status()
-    if action == "toggle":
-        if len(sys.argv) < 3:
-            raise SystemExit("usage: combine toggle <sink-name>")
-        return cmd_toggle(sys.argv[2])
-    if action == "on":
-        return cmd_on()
-    if action == "off":
-        return cmd_off()
-    raise SystemExit("usage: combine [status|toggle <sink>|on|off]")
+    lock_fd = exclusive_lock()
+    try:
+        if action == "status":
+            return cmd_status()
+        if action == "toggle":
+            if len(sys.argv) < 3:
+                raise SystemExit("usage: combine toggle <sink-name>")
+            return cmd_toggle(sys.argv[2])
+        if action == "on":
+            return cmd_on()
+        if action == "off":
+            return cmd_off()
+        raise SystemExit("usage: combine [status|toggle <sink>|on|off]")
+    finally:
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":
