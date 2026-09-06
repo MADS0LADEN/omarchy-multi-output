@@ -2,7 +2,7 @@ function emptyStatus() {
   return {
     ok: false,
     enabled: false,
-    sink: "muj_multi_output",
+    sink: "omarchy_multi_output",
     slaves: [],
     previousDefault: "",
     available: []
@@ -21,7 +21,7 @@ function parseStatus(raw) {
   return {
     ok: parsed.ok !== false,
     enabled: parsed.enabled === true,
-    sink: String(parsed.sink || "muj_multi_output"),
+    sink: String(parsed.sink || "omarchy_multi_output"),
     slaves: Array.isArray(parsed.slaves) ? parsed.slaves.map(String) : [],
     previousDefault: String(parsed.previousDefault || ""),
     available: Array.isArray(parsed.available) ? parsed.available : []
@@ -67,7 +67,7 @@ function tooltip(status) {
   if (status && status.enabled) {
     var labels = selectedLabels(status)
     if (labels.length) return "Playing on " + labels.join(" + ")
-    return "Multi-output on"
+    return "omarchy-multi-output on"
   }
   return "Play on several outputs at once"
 }

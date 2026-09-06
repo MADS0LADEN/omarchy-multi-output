@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "muj.multi-output",
-  "name": "Multi-output",
+  "id": "omarchy-multi-output",
+  "name": "omarchy-multi-output",
   "version": "1.0.0",
-  "author": "muj",
+  "author": "mads0laden",
   "license": "MIT",
   "description": "Play the same audio on two or more outputs at once, such as two AirPods.",
   "kinds": [
@@ -13,9 +13,13 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Multi-output",
+    "displayName": "omarchy-multi-output",
     "description": "Send system audio to several sinks at the same time",
     "category": "Audio",
+    "aliases": [
+      "multi-output",
+      "combine"
+    ],
     "allowMultiple": false,
     "defaultSection": "right"
   }

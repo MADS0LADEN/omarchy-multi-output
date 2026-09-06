@@ -7,8 +7,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "muj.multi-output"
-  ipcTarget: "muj.multi-output"
+  moduleName: "omarchy-multi-output"
+  ipcTarget: "omarchy-multi-output"
 
   readonly property string script:
     Qt.resolvedUrl("bin/combine").toString().replace(/^file:\/\//, "")
@@ -204,7 +204,7 @@ Panel {
 
         PanelHero {
           width: parent.width
-          title: "Multi-output"
+          title: "omarchy-multi-output"
           meta: Model.heroMeta(root.status)
           foreground: root.foreground
           fontFamily: root.fontFamily

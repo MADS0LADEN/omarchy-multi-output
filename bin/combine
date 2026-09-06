@@ -9,8 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-COMBINE_NAME = "muj_multi_output"
-COMBINE_DESCRIPTION = "Multi-output"
+COMBINE_NAME = "omarchy_multi_output"
+COMBINE_DESCRIPTION = "omarchy-multi-output"
+LEGACY_COMBINE_NAME = "muj_multi_output"
+OWNED_SINKS = (COMBINE_NAME, LEGACY_COMBINE_NAME)
 SKIP_PARTS = (
     "easyeffects",
     "filter-chain",
@@ -20,13 +22,13 @@ SKIP_PARTS = (
     "omarchy_speaker_tuning",
     "combine",
 )
-LEGACY_STATE_PATH = (
-    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    / "omarchy/plugins/muj.multi-output/state.json"
-)
-STATE_PATH = (
-    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    / "omarchy/muj.multi-output/state.json"
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+STATE_PATH = STATE_HOME / "omarchy/omarchy-multi-output/state.json"
+LEGACY_STATE_PATHS = (
+    STATE_HOME / "omarchy/muj.multi-output/state.json",
+    CONFIG_HOME / "omarchy/plugins/omarchy-multi-output/state.json",
+    CONFIG_HOME / "omarchy/plugins/muj.multi-output/state.json",
 )
 
 
@@ -47,7 +49,7 @@ def pactl_json(kind: str) -> list:
 
 def skip_sink(name: str) -> bool:
     lowered = name.lower()
-    if name == COMBINE_NAME:
+    if name in OWNED_SINKS:
         return True
     return any(part in lowered for part in SKIP_PARTS)
 
@@ -98,11 +100,13 @@ def load_state() -> dict:
     state = _read_state_file(STATE_PATH)
     if state is not None:
         return state
-    legacy = _read_state_file(LEGACY_STATE_PATH)
-    if legacy is not None:
+    for path in LEGACY_STATE_PATHS:
+        legacy = _read_state_file(path)
+        if legacy is None:
+            continue
         save_state(legacy)
         try:
-            LEGACY_STATE_PATH.unlink()
+            path.unlink()
         except OSError:
             pass
         return legacy
@@ -127,7 +131,9 @@ def combine_module() -> tuple[str | None, str]:
             continue
         index, name = parts[0], parts[1]
         argument = parts[2] if len(parts) > 2 else ""
-        if name == "module-combine-sink" and f"sink_name={COMBINE_NAME}" in argument:
+        if name != "module-combine-sink":
+            continue
+        if any(f"sink_name={owned}" in argument for owned in OWNED_SINKS):
             return index, argument
     return None, ""
 
@@ -144,8 +150,10 @@ def slaves_from_argument(argument: str) -> list[str]:
 
 
 def unload_combine() -> None:
-    module_id = combine_module_id()
-    if module_id:
+    while True:
+        module_id = combine_module_id()
+        if not module_id:
+            return
         run(["pactl", "unload-module", module_id])
 
 
@@ -189,7 +197,7 @@ def apply(state: dict, available: list[dict]) -> dict:
             restore_previous(state, available_names)
         return state
 
-    if current_default and current_default != COMBINE_NAME:
+    if current_default and current_default not in OWNED_SINKS:
         state["previousDefault"] = current_default
 
     unload_combine()
