@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "omarchy-multi-output",
-  "name": "omarchy-multi-output",
+  "name": "Multi-output",
   "version": "1.1.0",
   "author": "mads0laden",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "omarchy-multi-output",
+    "displayName": "Multi-output",
     "description": "Send system audio to several sinks at the same time",
     "category": "Audio",
     "aliases": [

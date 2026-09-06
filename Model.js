@@ -129,7 +129,7 @@ function tooltip(status) {
   if (status && status.enabled) {
     var labels = selectedLabels(status)
     if (labels.length) return plain("Playing on " + labels.join(" + "), 160)
-    return "omarchy-multi-output on"
+    return "Multi-output on"
   }
   return "Play on several outputs at once"
 }

@@ -305,7 +305,7 @@ Panel {
 
         PanelHero {
           width: parent.width
-          title: "omarchy-multi-output"
+          title: "Multi-output"
           meta: root.heroMetaText
           foreground: root.foreground
           fontFamily: root.fontFamily

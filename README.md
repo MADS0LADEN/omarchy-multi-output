@@ -1,21 +1,18 @@
-# omarchy-multi-output
+# Multi-output
 
 Bar widget that plays the same audio on two or more outputs at once, such as
 two AirPods.
 
 Plugin id: `omarchy-multi-output`. Repository:
-`https://github.com/mads0laden/omarchy-multi-output.git`.
+`https://github.com/MADS0LADEN/omarchy-multi-output`.
 
 This plugin does not use the network. It talks to the local PipeWire/Pulse
 daemon with `/usr/bin/pactl` and stores the selected sink names on disk.
 
 ## Install
 
-The repository is private. Clone it with an account that can read
-`mads0laden/omarchy-multi-output`:
-
 ```bash
-omarchy plugin add https://github.com/mads0laden/omarchy-multi-output.git --enable
+omarchy plugin add https://github.com/MADS0LADEN/omarchy-multi-output.git --enable
 ```
 
 ## Remove
