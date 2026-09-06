@@ -15,7 +15,7 @@ import sys
 import time
 
 COMBINE_NAME = "omarchy_multi_output"
-COMBINE_DESCRIPTION = "omarchy-multi-output"
+COMBINE_DESCRIPTION = "Multi-output"
 LEGACY_COMBINE_NAME = "muj_multi_output"
 OWNED_SINKS = (COMBINE_NAME, LEGACY_COMBINE_NAME)
 SKIP_PARTS = (
